@@ -559,7 +559,7 @@ def _perform_dry_run(config, api, check_files: int | None = None) -> None:
 
     Logs (at INFO level):
       - Drive destination path + root-level item count (when Drive is configured)
-      - Photos destination path + library names (when Photos is configured)
+      - Photos destination path + library and Shared Album names
       - When ``check_files`` is not None: per-library would-skip /
         size-mismatch / not-found counts (see ``migration_check``).
 
@@ -616,6 +616,69 @@ def _perform_dry_run(config, api, check_files: int | None = None) -> None:
                 )
             else:
                 LOGGER.info("DRY RUN: Photos libraries: (none reported by iCloud)")
+
+            filters = config_parser.get_photos_filters(config=config)
+            if filters["libraries"] is False:
+                LOGGER.info("DRY RUN: Photo Library syncing is disabled by config")
+            if filters["shared_albums"] is False:
+                LOGGER.info("DRY RUN: iCloud Shared Albums are disabled by config")
+            elif config_parser.photos_shared_albums_destination_conflicts(
+                config=config,
+            ) or sync_photos._regular_library_output_conflicts_with_shared_albums(  # noqa: SLF001
+                photos=api.photos,
+                libraries=(
+                    []
+                    if filters["libraries"] is False
+                    else (
+                        filters["libraries"]
+                        if filters["libraries"] is not None
+                        else libraries
+                    )
+                ),
+                download_all=config_parser.get_photos_all_albums(config=config),
+                filters=filters,
+                destination_path=photos_destination,
+                library_destinations=config_parser.get_photos_library_destinations(
+                    config=config,
+                ),
+                shared_albums_root=os.path.join(
+                    photos_destination,
+                    config_parser.get_photos_shared_albums_destination(config=config),
+                ),
+            ):
+                LOGGER.warning(
+                    "DRY RUN: iCloud Shared Albums would be skipped because their "
+                    "destination conflicts with a photo library destination",
+                )
+            else:
+                shared_albums, enumerated = sync_photos._get_shared_albums(  # noqa: SLF001
+                    api.photos,
+                )
+                if enumerated:
+                    selected = sync_photos._select_shared_albums(  # noqa: SLF001
+                        shared_albums,
+                        filters["shared_albums"],
+                    )
+                    directory_names = sync_photos._shared_album_directory_names(  # noqa: SLF001
+                        selected,
+                    )
+                    shared_root = os.path.join(
+                        photos_destination,
+                        config_parser.get_photos_shared_albums_destination(
+                            config=config,
+                        ),
+                    )
+                    if selected:
+                        for album_name in selected:
+                            LOGGER.info(
+                                f"DRY RUN: iCloud Shared Album {album_name!r} "
+                                f"would sync to "
+                                f"{os.path.join(shared_root, directory_names[album_name])}",
+                            )
+                    else:
+                        LOGGER.info(
+                            "DRY RUN: iCloud Shared Albums: (none selected or reported)",
+                        )
         except Exception as e:
             LOGGER.warning(f"DRY RUN: Photos enumeration failed: {e!s}")
     else:
@@ -661,6 +724,23 @@ def _perform_dry_run(config, api, check_files: int | None = None) -> None:
                                 LOGGER.info(
                                     f"DRY RUN:   sample {status}: {path} ({expected:,}b)",
                                 )
+
+                shared_results = migration_check.check_shared_albums_migration(
+                    api=api,
+                    config=config,
+                    sample=check_files,
+                )
+                for album_name, result in shared_results.items():
+                    stats = result["stats"]
+                    LOGGER.info(
+                        f"DRY RUN: iCloud Shared Album {album_name!r} "
+                        f"(dest {result['album_dest']}): "
+                        f"sampled={result['checked']} "
+                        f"would_skip={stats['would_skip']} "
+                        f"size_mismatch={stats['size_mismatch']} "
+                        f"not_found={stats['not_found']} "
+                        f"errors={stats['error']}",
+                    )
             except Exception as e:
                 LOGGER.warning(f"DRY RUN: photos check-files walk failed: {e!s}")
 

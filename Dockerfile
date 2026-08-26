@@ -8,7 +8,6 @@ COPY requirements.txt .
 RUN \
   echo "**** install build packages ****" && \
   apk add --no-cache --virtual=build-dependencies \
-    git \
     gcc \
     musl-dev \
     python3-dev \

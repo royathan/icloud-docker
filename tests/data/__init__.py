@@ -3868,7 +3868,11 @@ class ICloudPySessionMock(base.ICloudPySession):
         if "com.apple.photos.cloud" in url:
             if url.endswith("zones/list"):
                 return ResponseMock(ZONES_LIST_WORKING)
-            if url.endswith("remapEnums=True&getCurrentSyncToken=True"):
+            # The Shared Albums-capable icloudpy fork adds ``dsid`` to the
+            # Photos query parameters. Match the endpoint path instead of the
+            # old exact query-string suffix so this mock remains stable when
+            # authenticated account parameters are appended.
+            if "/records/query?" in url:
                 if data.get("query").get("recordType") == "CheckIndexingState":
                     return ResponseMock(
                         photos_data.DATA["query?remapEnums=True&getCurrentSyncToken=True"][0]["response"],

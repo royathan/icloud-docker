@@ -760,6 +760,120 @@ class TestCheckMigrationOrchestrator(unittest.TestCase):
             migration_check.check_migration(api=api, config=self.config, sample=0)
         fake_setter.assert_called_once_with("simple")
 
+    def test_check_migration_skips_disabled_libraries(self):
+        """The Shared Album-only smoke-test mode does not walk libraries."""
+        api = MagicMock()
+        api.photos.libraries = {"PrimarySync": _fake_library([])}
+        self.config["photos"]["filters"]["libraries"] = False
+        self.assertEqual(
+            migration_check.check_migration(
+                api=api,
+                config=self.config,
+                sample=0,
+            ),
+            {},
+        )
+
+    def test_check_shared_album_collects_statuses_and_caps_sample(self):
+        """Shared Album dry-run uses the album-shaped path and status format."""
+        photos = [object(), object(), object(), object()]
+        statuses = [
+            ("would_skip", "/a", 10, 10),
+            ("size_mismatch", "/b", 20, 15),
+            ("not_found", "/c", 30, 0),
+            ("error", "", 0, 0),
+        ]
+        from unittest.mock import patch
+
+        with patch.object(
+            migration_check,
+            "_check_one_photo",
+            side_effect=statuses,
+        ):
+            result = migration_check.check_shared_album(
+                album=photos,
+                album_name="Family",
+                album_destination="/shared-albums/Family",
+                folder_format=None,
+                sample=0,
+            )
+        self.assertEqual(result["checked"], 4)
+        self.assertEqual(result["stats"], dict.fromkeys(result["stats"], 1))
+        self.assertEqual(result["samples"]["size_mismatch"], [("/b", 20, 15)])
+
+        with patch.object(
+            migration_check,
+            "_check_one_photo",
+            return_value=("not_found", "/only", 1, 0),
+        ) as check_one:
+            capped = migration_check.check_shared_album(
+                album=photos,
+                album_name="Family",
+                album_destination="/shared-albums/Family",
+                folder_format=None,
+                sample=1,
+            )
+        self.assertEqual(capped["checked"], 1)
+        check_one.assert_called_once()
+
+    def test_check_shared_album_isolates_iteration_error(self):
+        """A failed private album iterator yields a partial, nonfatal report."""
+
+        class BrokenAlbum:
+            def __iter__(self):
+                message = "page failed"
+                raise RuntimeError(message)
+                yield  # pragma: no cover - makes this an iterator
+
+        with self.assertLogs(migration_check.LOGGER, level="WARNING") as captured:
+            result = migration_check.check_shared_album(
+                album=BrokenAlbum(),
+                album_name="Family",
+                album_destination="/shared-albums/Family",
+                folder_format=None,
+                sample=0,
+            )
+        self.assertEqual(result["checked"], 0)
+        self.assertIn("page failed", "\n".join(captured.output))
+
+    def test_check_shared_albums_migration_uses_dedicated_namespace(self):
+        """Shared Album migration checks follow selection and safe paths."""
+        family = [_fake_photo("IMG_1.HEIC", 100)]
+        api = MagicMock()
+        api.photos.libraries = {}
+        api.photos.shared_albums = {
+            "Family/Trips": MagicMock(id="family-id", __iter__=lambda self: iter(family)),
+        }
+        self.config["photos"]["filters"]["libraries"] = False
+        self.config["photos"]["filters"]["shared_albums"] = ["Family/Trips"]
+
+        results = migration_check.check_shared_albums_migration(
+            api=api,
+            config=self.config,
+            sample=1,
+        )
+
+        self.assertEqual(set(results), {"Family/Trips"})
+        self.assertIn(
+            os.path.join("photos", "shared-albums", "Family_Trips"),
+            results["Family/Trips"]["album_dest"],
+        )
+        self.assertEqual(results["Family/Trips"]["checked"], 1)
+
+    def test_check_shared_albums_migration_respects_disable(self):
+        """Explicit Shared Albums opt-out produces no dry-run walk."""
+        api = MagicMock()
+        api.photos.libraries = {}
+        self.config["photos"]["filters"]["shared_albums"] = False
+        self.assertEqual(
+            migration_check.check_shared_albums_migration(
+                api=api,
+                config=self.config,
+                sample=1,
+            ),
+            {},
+        )
+
     def test_check_drive_migration_returns_none_when_no_drive_section(self):
         config = {"photos": {"destination": "/photos"}}
         self.assertIsNone(

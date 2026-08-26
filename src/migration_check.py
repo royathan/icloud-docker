@@ -52,7 +52,13 @@ except (
 
 
 try:
-    from src.sync_photos import _library_destination  # type: ignore[attr-defined]
+    from src.sync_photos import (  # type: ignore[attr-defined]
+        _get_shared_albums,
+        _library_destination,
+        _regular_library_output_conflicts_with_shared_albums,
+        _select_shared_albums,
+        _shared_album_directory_names,
+    )
 except (
     ImportError
 ):  # pragma: no cover — only when feat/photos-library-destinations isn't merged
@@ -61,6 +67,8 @@ except (
         base_destination: str,
         library: str,
         library_destinations: dict,
+        *,
+        create: bool = True,
     ) -> str:
         """Fallback that always returns the base destination.
 
@@ -131,7 +139,12 @@ def check_library(
     ago) will match. Use a sample size proportional to the time
     range you care about validating.
     """
-    library_dest = _library_destination(photos_base, library_name, mapping)
+    library_dest = _library_destination(
+        photos_base,
+        library_name,
+        mapping,
+        create=False,
+    )
     # Match the real sync's default path layout: ``_sync_all_photos_in_library``
     # in src/sync_photos.py iterates ``library.all`` (not
     # ``library.albums["All Photos"]``) and writes under
@@ -216,6 +229,10 @@ def check_migration(api, config: dict, sample: int = 0) -> dict[str, Any]:
     if filename_format:
         set_default_filename_format(filename_format)
 
+    filters = config_parser.get_photos_filters(config=config)
+    if filters["libraries"] is False:
+        return {}
+
     results: dict[str, Any] = {}
     for library_name in api.photos.libraries:
         LOGGER.info(
@@ -227,6 +244,130 @@ def check_migration(api, config: dict, sample: int = 0) -> dict[str, Any]:
             library_name=library_name,
             photos_base=photos_base,
             mapping=mapping,
+            folder_format=folder_format,
+            sample=sample,
+        )
+    return results
+
+
+def check_shared_album(
+    album: Any,
+    album_name: str,
+    album_destination: str,
+    folder_format: str | None,
+    sample: int,
+) -> dict[str, Any]:
+    """Check existing files for one album-shaped iCloud Shared Album.
+
+    Args:
+        album: Iterable Shared Album object
+        album_name: Human-readable album name for logging
+        album_destination: Exact directory used by the real sync
+        folder_format: Optional date-folder format
+        sample: Assets to check; zero means every asset
+
+    Returns:
+        Per-album dry-run statistics and sample paths
+    """
+    stats = {"would_skip": 0, "size_mismatch": 0, "not_found": 0, "error": 0}
+    samples = {"would_skip": [], "size_mismatch": [], "not_found": []}
+    checked = 0
+    try:
+        for photo in album:
+            if sample > 0 and checked >= sample:
+                break
+            checked += 1
+            status, path, expected, actual = _check_one_photo(
+                photo,
+                album_destination,
+                folder_format,
+            )
+            stats[status] = stats.get(status, 0) + 1
+            if status in samples and len(samples[status]) < 3:
+                if status == "size_mismatch":
+                    samples[status].append((path, expected, actual))
+                else:
+                    samples[status].append((path, expected))
+    except Exception as error:  # noqa: BLE001 - dry-run isolates each album
+        LOGGER.warning(
+            f"check_migration: walk of iCloud Shared Album {album_name!r} "
+            f"stopped early: {error!s}",
+        )
+
+    return {
+        "album_dest": album_destination,
+        "checked": checked,
+        "stats": stats,
+        "samples": samples,
+    }
+
+
+def check_shared_albums_migration(
+    api: Any,
+    config: dict,
+    sample: int = 0,
+) -> dict[str, Any]:
+    """Check files for the configured iCloud Shared Albums without writes.
+
+    Args:
+        api: Authenticated ICloudPyService instance
+        config: Live configuration dictionary
+        sample: Assets per album to check; zero means all
+
+    Returns:
+        Mapping of Shared Album name to dry-run result
+    """
+    filters = config_parser.get_photos_filters(config=config)
+    selection = filters["shared_albums"]
+    photos_base = os.path.join(
+        config_parser.get_root_destination_path(config=config),
+        config_parser.get_photos_destination_path(config=config),
+    )
+    shared_albums_root = os.path.join(
+        photos_base,
+        config_parser.get_photos_shared_albums_destination(config=config),
+    )
+    libraries = (
+        []
+        if filters["libraries"] is False
+        else (
+            filters["libraries"]
+            if filters["libraries"] is not None
+            else api.photos.libraries
+        )
+    )
+    if selection is False or config_parser.photos_shared_albums_destination_conflicts(
+        config=config,
+    ) or _regular_library_output_conflicts_with_shared_albums(
+        photos=api.photos,
+        libraries=libraries,
+        download_all=config_parser.get_photos_all_albums(config=config),
+        filters=filters,
+        destination_path=photos_base,
+        library_destinations=config_parser.get_photos_library_destinations(
+            config=config,
+        ),
+        shared_albums_root=shared_albums_root,
+    ):
+        return {}
+
+    shared_albums, enumerated = _get_shared_albums(api.photos)
+    if not enumerated:
+        return {}
+    selected = _select_shared_albums(shared_albums, selection)
+    directory_names = _shared_album_directory_names(selected)
+    folder_format = config_parser.get_photos_folder_format(config=config)
+
+    results = {}
+    for album_name, album in selected.items():
+        album_destination = os.path.join(
+            shared_albums_root,
+            directory_names[album_name],
+        )
+        results[album_name] = check_shared_album(
+            album=album,
+            album_name=album_name,
+            album_destination=album_destination,
             folder_format=folder_format,
             sample=sample,
         )

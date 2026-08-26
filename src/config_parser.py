@@ -840,7 +840,79 @@ def get_photos_library_destinations(config: dict) -> dict[str, str]:
     return {str(k): str(v) for k, v in mapping.items()}
 
 
-def get_photos_libraries_filter(config: dict, base_config_path: list[str]) -> list[str] | None:
+def get_photos_shared_albums_destination(config: dict) -> str:
+    """Get the destination subdirectory reserved for iCloud Shared Albums.
+
+    Shared Albums are not photo libraries, so this setting is deliberately
+    separate from ``photos.library_destinations``. The returned value is a
+    relative path beneath ``photos.destination``; unsafe values fall back to
+    the backward-compatible default namespace.
+
+    Args:
+        config: Configuration dictionary
+
+    Returns:
+        Safe relative Shared Albums destination (default: ``shared-albums``)
+    """
+    config_path = ["photos", "shared_albums_destination"]
+    destination = str(
+        get_config_value_or_default(
+            config=config,
+            config_path=config_path,
+            default="shared-albums",
+        ),
+    ).strip()
+    normalized = destination.replace("\\", "/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or any(component in {"", ".", ".."} for component in normalized.split("/"))
+    ):
+        log_invalid_config_value(
+            config_path,
+            destination,
+            "a non-empty relative path without '.', '..', or empty components",
+        )
+        return "shared-albums"
+    return normalized
+
+
+def photos_shared_albums_destination_conflicts(config: dict) -> bool:
+    """Return whether Shared Albums would overlap a configured library root.
+
+    ``library_destinations`` applies to regular and Shared Photo Libraries,
+    while ``shared_albums_destination`` applies only to Apple Shared Albums.
+    Treating the same normalized, case-folded path as both source types would
+    merge unrelated album trees, so callers must skip Shared Albums until the
+    configuration is corrected.
+
+    Args:
+        config: Configuration dictionary
+
+    Returns:
+        True when one or more configured library destinations conflict
+    """
+    shared_destination = get_photos_shared_albums_destination(config=config)
+    shared_key = shared_destination.replace("\\", "/").casefold()
+    conflicts = [
+        library
+        for library, destination in get_photos_library_destinations(config=config).items()
+        if str(destination).replace("\\", "/").strip("/").casefold() == shared_key
+    ]
+    if conflicts:
+        LOGGER.error(
+            "photos.shared_albums_destination conflicts with "
+            f"photos.library_destinations for {', '.join(sorted(conflicts))}; "
+            "iCloud Shared Albums will be skipped to prevent source trees from merging.",
+        )
+        return True
+    return False
+
+
+def get_photos_libraries_filter(
+    config: dict,
+    base_config_path: list[str],
+) -> list[str] | bool | None:
     """Get libraries filter from photos config.
 
     Args:
@@ -848,18 +920,24 @@ def get_photos_libraries_filter(config: dict, base_config_path: list[str]) -> li
         base_config_path: Base path to filters section
 
     Returns:
-        List of library names if configured, None otherwise
+        List of library names if configured, False if disabled, None otherwise
     """
     config_path = base_config_path + ["libraries"]
     libraries = get_config_value_or_none(config=config, config_path=config_path)
 
-    if not libraries or len(libraries) == 0:
+    if libraries is False:
+        log_config_found_info("Photo Library syncing is disabled.")
+        return False
+    if libraries is None or libraries == []:
         log_config_not_found_warning(
             config_path, "not found. Downloading all libraries ...",
         )
         return None
 
-    return libraries
+    if isinstance(libraries, list):
+        return [str(library) for library in libraries]
+    log_invalid_config_value(config_path, libraries, "false or a list of library names")
+    return None
 
 
 def get_photos_albums_filter(
@@ -884,6 +962,45 @@ def get_photos_albums_filter(
         return None
 
     return albums
+
+
+def get_photos_shared_albums_filter(
+    config: dict,
+    base_config_path: list[str],
+) -> list[str] | bool | None:
+    """Get the independent iCloud Shared Albums selection.
+
+    An absent key returns ``None`` (sync every Shared Album), ``false``
+    disables Shared Albums, and a non-empty list selects exact album names.
+    Empty lists are treated like an absent key, matching the existing photos
+    filter convention that empty lists mean "all".
+
+    Args:
+        config: Configuration dictionary
+        base_config_path: Base path to filters section
+
+    Returns:
+        ``None`` for all, ``False`` for disabled, or a list of album names
+    """
+    config_path = base_config_path + ["shared_albums"]
+    if not traverse_config_path(config=config, config_path=config_path):
+        return None
+
+    shared_albums = get_config_value(config=config, config_path=config_path)
+    if shared_albums is False:
+        log_config_found_info("iCloud Shared Albums syncing is disabled.")
+        return False
+    if shared_albums is None or shared_albums == []:
+        return None
+    if isinstance(shared_albums, list):
+        return [str(album) for album in shared_albums]
+
+    log_invalid_config_value(
+        config_path,
+        shared_albums,
+        "false or a list of Shared Album names",
+    )
+    return None
 
 
 def get_photos_file_sizes_filter(
@@ -946,6 +1063,7 @@ def get_photos_filters(config: dict) -> dict[str, Any]:
     photos_filters = {
         "libraries": None,
         "albums": None,
+        "shared_albums": None,
         "file_sizes": ["original"],
         "extensions": None,
     }
@@ -963,6 +1081,10 @@ def get_photos_filters(config: dict) -> dict[str, Any]:
     # Parse individual filter components
     photos_filters["libraries"] = get_photos_libraries_filter(config, base_config_path)
     photos_filters["albums"] = get_photos_albums_filter(config, base_config_path)
+    photos_filters["shared_albums"] = get_photos_shared_albums_filter(
+        config,
+        base_config_path,
+    )
     photos_filters["file_sizes"] = get_photos_file_sizes_filter(
         config, base_config_path,
     )

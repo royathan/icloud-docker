@@ -1,5 +1,5 @@
-icloudpy==0.9.0
+icloudpy @ https://github.com/royathan/icloudpy/archive/8ff5358aa5996ba3dce61a5fea7e8f25391dd2be.tar.gz
 ruamel.yaml==0.19.1
 python-magic==0.4.27
-requests~=2.32.3
+requests~=2.34.2
 flask==3.1.3

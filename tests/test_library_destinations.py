@@ -78,6 +78,19 @@ class TestLibraryDestinationHelper(unittest.TestCase):
             assert result == os.path.join(base, "by-source", "personal")
             assert os.path.isdir(result)
 
+    def test_read_only_resolution_does_not_create_directory(self):
+        """Dry-run callers can resolve mapped paths without filesystem writes."""
+        with tempfile.TemporaryDirectory() as base:
+            mapping = {"PrimarySync": "personal"}
+            result = _library_destination(
+                base,
+                "PrimarySync",
+                mapping,
+                create=False,
+            )
+            assert result == os.path.join(base, "personal")
+            assert not os.path.exists(result)
+
     def test_none_mapping_is_safe(self):
         with tempfile.TemporaryDirectory() as base:
             result = _library_destination(base, "PrimarySync", None)

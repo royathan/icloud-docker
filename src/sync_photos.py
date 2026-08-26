@@ -6,12 +6,17 @@ orchestrating the downloading of photos from iCloud to local storage.
 
 ___author___ = "Mandar Patil <mandarons@pm.me>"
 
+import hashlib
 import os
+import unicodedata
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 from src import config_parser, configure_icloudpy_logging, get_logger
 from src.album_sync_orchestrator import sync_album_photos
 from src.hardlink_registry import create_hardlink_registry
 from src.photo_cleanup_utils import remove_obsolete_files
+from src.photo_path_utils import normalize_file_path
 
 # Configure icloudpy logging immediately after import
 configure_icloudpy_logging()
@@ -390,8 +395,22 @@ def sync_photos(config, photos):
     files = set()
     download_all = config_parser.get_photos_all_albums(config=config)
     use_hardlinks = config_parser.get_photos_use_hardlinks(config=config)
-    libraries = filters["libraries"] if filters["libraries"] is not None else photos.libraries
+    libraries = (
+        []
+        if filters["libraries"] is False
+        else (
+            filters["libraries"]
+            if filters["libraries"] is not None
+            else photos.libraries
+        )
+    )
     folder_format = config_parser.get_photos_folder_format(config=config)
+    shared_albums_root = normalize_file_path(
+        os.path.join(
+            destination_path,
+            config_parser.get_photos_shared_albums_destination(config=config),
+        ),
+    )
 
     # Initialize hard link registry using new modular approach
     hardlink_registry = create_hardlink_registry(use_hardlinks)
@@ -430,28 +449,353 @@ def sync_photos(config, photos):
     total_successful += sub_successful
     total_failed += sub_failed
 
+    # Shared Albums are a separate Apple service, not entries in
+    # ``photos.libraries``. Keep them album-shaped in their own namespace while
+    # reusing the exact same download pipeline and hardlink registry.
+    shared_albums_conflict = (
+        config_parser.photos_shared_albums_destination_conflicts(config=config)
+        or _regular_library_output_conflicts_with_shared_albums(
+            photos=photos,
+            libraries=libraries,
+            download_all=download_all,
+            filters=filters,
+            destination_path=destination_path,
+            library_destinations=library_destinations,
+            shared_albums_root=shared_albums_root,
+        )
+    )
+    if shared_albums_conflict:
+        sub_successful, sub_failed, shared_albums_enumerated = 0, 0, False
+    else:
+        sub_successful, sub_failed, shared_albums_enumerated = _sync_shared_albums(
+            photos=photos,
+            selection=filters["shared_albums"],
+            destination_path=shared_albums_root,
+            filters=filters,
+            files=files,
+            folder_format=folder_format,
+            hardlink_registry=hardlink_registry,
+            config=config,
+        )
+    total_successful += sub_successful
+    total_failed += sub_failed
+
     # Clean up obsolete files if enabled. When per-library destinations are
     # configured we walk each library's subdir independently, otherwise the
     # legacy single-destination walk preserves backward compatibility.
     if config_parser.get_photos_remove_obsolete(config=config):
         marker_filename = config_parser.get_mount_marker_filename(config=config)
         exclude = {marker_filename}
+        # If Shared Albums were disabled or unavailable, preserve any prior
+        # Shared Album files during a broader legacy destination cleanup. An
+        # unavailable private endpoint must never look like a server-side
+        # deletion of every Shared Album.
+        if not shared_albums_enumerated and os.path.isdir(shared_albums_root):
+            for root, _dirs, shared_files in os.walk(shared_albums_root):
+                for filename in shared_files:
+                    files.add(normalize_file_path(os.path.join(root, filename)))
+
+        cleanup_destinations = []
         if library_destinations:
             for library in libraries:
                 lib_dest = _library_destination(destination_path, library, library_destinations)
-                remove_obsolete_files(lib_dest, files, exclude_filenames=exclude)
+                if lib_dest not in cleanup_destinations:
+                    cleanup_destinations.append(lib_dest)
         else:
-            remove_obsolete_files(destination_path, files, exclude_filenames=exclude)
+            cleanup_destinations.append(destination_path)
+        if shared_albums_enumerated and shared_albums_root not in cleanup_destinations:
+            cleanup_destinations.append(shared_albums_root)
+        for cleanup_destination in cleanup_destinations:
+            remove_obsolete_files(
+                cleanup_destination,
+                files,
+                exclude_filenames=exclude,
+            )
 
     return total_successful, total_failed
 
 
-def _library_destination(base_destination: str, library: str, library_destinations: dict) -> str:
+def _regular_library_output_conflicts_with_shared_albums(
+    photos: Any,
+    libraries: Iterable[str],
+    download_all: bool,
+    filters: dict[str, Any],
+    destination_path: str,
+    library_destinations: dict[str, str],
+    shared_albums_root: str,
+) -> bool:
+    """Detect a regular-library album planned at the Shared Albums root.
+
+    This protects legacy configurations without ``library_destinations``:
+    their libraries continue writing directly beneath ``photos.destination``,
+    but an album literally named like the reserved Shared Albums namespace
+    must not be mixed with Apple Shared Album contents.
+
+    Args:
+        photos: iCloudPy Photos service
+        libraries: Regular/Shared Photo Library names selected for syncing
+        download_all: Value of ``photos.all_albums``
+        filters: Parsed photo filters
+        destination_path: Base Photos destination
+        library_destinations: Optional per-library destination mapping
+        shared_albums_root: Resolved Apple Shared Albums root
+
+    Returns:
+        True when a planned regular-library output equals the reserved root
+    """
+    shared_key = normalize_file_path(shared_albums_root).casefold()
+    for library in libraries:
+        library_destination = _library_destination(
+            destination_path,
+            library,
+            library_destinations,
+            create=False,
+        )
+        if download_all and library == "PrimarySync":
+            album_names = [
+                album_name
+                for album_name in photos.libraries[library].albums
+                if not filters["albums"] or album_name not in filters["albums"]
+            ]
+        elif filters["albums"] and library == "PrimarySync":
+            album_names = list(filters["albums"])
+        elif filters["albums"]:
+            album_names = [
+                album_name
+                for album_name in filters["albums"]
+                if album_name in photos.libraries[library].albums
+            ]
+        else:
+            album_names = ["all"]
+
+        for album_name in album_names:
+            planned = normalize_file_path(
+                os.path.join(library_destination, album_name),
+            ).casefold()
+            if planned == shared_key:
+                LOGGER.error(
+                    f"Photo library {library!r} album {album_name!r} is planned at "
+                    f"the reserved iCloud Shared Albums root {shared_albums_root!r}; "
+                    "iCloud Shared Albums will be skipped to prevent source trees "
+                    "from merging. Configure photos.shared_albums_destination or "
+                    "photos.library_destinations to use distinct paths.",
+                )
+                return True
+    return False
+
+
+def _safe_shared_album_component(album_name: str) -> str:
+    """Convert a Shared Album name to one safe, NFC filesystem component.
+
+    Args:
+        album_name: Album name returned by iCloud
+
+    Returns:
+        Sanitized non-empty directory name
+    """
+    normalized = unicodedata.normalize("NFC", str(album_name))
+    unsafe = '<>:"/\\|?*'
+    component = "".join(
+        "_" if character in unsafe or ord(character) < 32 else character
+        for character in normalized
+    )
+    component = component.strip().rstrip(".")
+    return component if component not in {"", ".", ".."} else "unnamed"
+
+
+def _shared_album_directory_names(
+    shared_albums: Mapping[str, Any],
+) -> dict[str, str]:
+    """Resolve stable directory names, suffixing sanitized collisions.
+
+    Collision comparison uses Unicode case-folding so the paths are also safe
+    on the common case-insensitive macOS filesystems. Every member of a
+    collision group receives a suffix, making the outcome independent of API
+    iteration order.
+
+    Args:
+        shared_albums: Shared Albums keyed by display name. Each album must
+            expose a stable ``id`` (or legacy ``album_guid``) identifier.
+
+    Returns:
+        Mapping of original album name to deterministic directory component
+    """
+    components = {
+        album_name: _safe_shared_album_component(album_name)
+        for album_name in shared_albums
+    }
+    collision_counts: dict[str, int] = {}
+    for component in components.values():
+        key = component.casefold()
+        collision_counts[key] = collision_counts.get(key, 0) + 1
+
+    resolved = {}
+    for album_name, component in components.items():
+        if collision_counts[component.casefold()] > 1:
+            album = shared_albums[album_name]
+            stable_id = getattr(album, "id", None) or getattr(
+                album,
+                "album_guid",
+                None,
+            )
+            if stable_id is None:
+                LOGGER.warning(
+                    f"iCloud Shared Album {album_name!r} has no stable identifier; "
+                    "using its display name for the collision suffix.",
+                )
+                stable_id = album_name
+            digest = hashlib.sha256(str(stable_id).encode("utf-8")).hexdigest()[:10]
+            component = f"{component}__{digest}"
+        resolved[album_name] = component
+    return resolved
+
+
+def _get_shared_albums(photos: Any) -> tuple[Mapping[str, Any], bool]:
+    """Read Shared Albums without allowing the private service to break Photos.
+
+    Args:
+        photos: iCloudPy Photos service
+
+    Returns:
+        Tuple of (album mapping, successfully enumerated flag)
+    """
+    try:
+        shared_albums = photos.shared_albums
+    except AttributeError:
+        LOGGER.info(
+            "iCloud Shared Albums are unavailable in this account/client; "
+            "continuing with photo libraries.",
+        )
+        return {}, False
+    except Exception as error:  # noqa: BLE001 - private API must be isolated
+        LOGGER.warning(
+            f"Unable to enumerate iCloud Shared Albums; continuing with photo "
+            f"libraries: {type(error).__name__}: {error!s}",
+        )
+        return {}, False
+
+    if not isinstance(shared_albums, Mapping):
+        LOGGER.warning(
+            "iCloud Shared Albums returned an unexpected response; continuing "
+            "with photo libraries.",
+        )
+        return {}, False
+    return shared_albums, True
+
+
+def _select_shared_albums(
+    shared_albums: Mapping[str, Any],
+    selection: list[str] | bool | None,
+) -> dict[str, Any]:
+    """Apply the independent Shared Albums selection.
+
+    Args:
+        shared_albums: Available Shared Albums keyed by exact name
+        selection: None for all, False for disabled, or exact names
+
+    Returns:
+        Selected album mapping in deterministic name order
+    """
+    if selection is False:
+        return {}
+    names = sorted(shared_albums) if selection is None else selection
+    selected = {}
+    for album_name in names:
+        if album_name in shared_albums:
+            selected[album_name] = shared_albums[album_name]
+        else:
+            LOGGER.warning(
+                f"iCloud Shared Album {album_name!r} was not found; skipping it.",
+            )
+    return selected
+
+
+def _sync_shared_albums(
+    photos: Any,
+    selection: list[str] | bool | None,
+    destination_path: str,
+    filters: dict[str, Any],
+    files: set[str],
+    folder_format: str | None,
+    hardlink_registry: Any,
+    config: dict,
+) -> tuple[int, int, bool]:
+    """Sync selected iCloud Shared Albums through the normal album pipeline.
+
+    Args:
+        photos: iCloudPy Photos service
+        selection: None for all, False for disabled, or exact album names
+        destination_path: Dedicated Shared Albums root
+        filters: Parsed photo filters
+        files: Set of server-backed local paths for cleanup
+        folder_format: Optional date-folder format
+        hardlink_registry: Cross-album hardlink registry, if enabled
+        config: Configuration dictionary
+
+    Returns:
+        Tuple of (successful downloads, failures, enumeration succeeded)
+    """
+    if selection is False:
+        LOGGER.info("iCloud Shared Albums syncing is disabled by configuration.")
+        return 0, 0, False
+
+    shared_albums, enumerated = _get_shared_albums(photos)
+    if not enumerated:
+        return 0, 0, False
+
+    selected = _select_shared_albums(shared_albums, selection)
+    if not selected:
+        LOGGER.info("No iCloud Shared Albums selected for syncing.")
+        return 0, 0, True
+
+    directory_names = _shared_album_directory_names(selected)
+    total_successful, total_failed = 0, 0
+    for album_name, album in selected.items():
+        album_destination = os.path.join(
+            destination_path,
+            directory_names[album_name],
+        )
+        LOGGER.info(
+            f"Syncing iCloud Shared Album {album_name!r} to {album_destination}",
+        )
+        try:
+            result = sync_album_photos(
+                album=album,
+                destination_path=album_destination,
+                file_sizes=filters["file_sizes"],
+                extensions=filters["extensions"],
+                files=files,
+                folder_format=folder_format,
+                hardlink_registry=hardlink_registry,
+                config=config,
+            )
+        except Exception as error:  # noqa: BLE001 - isolate each Shared Album
+            LOGGER.error(
+                f"Failed to sync iCloud Shared Album {album_name!r}; continuing: "
+                f"{type(error).__name__}: {error!s}",
+            )
+            total_failed += 1
+            continue
+        if result is not None:
+            successful, failed = result
+            total_successful += successful
+            total_failed += failed
+    return total_successful, total_failed, True
+
+
+def _library_destination(
+    base_destination: str,
+    library: str,
+    library_destinations: dict | None,
+    *,
+    create: bool = True,
+) -> str:
     """Resolve the on-disk destination for a given iCloud photo library.
 
     When ``library_destinations`` provides a mapping for ``library``, joins
     the configured subdirectory under ``base_destination`` and ensures the
-    directory exists. Otherwise returns ``base_destination`` unchanged
+    directory exists when ``create`` is true. Otherwise returns
+    ``base_destination`` unchanged
     (preserving mandarons' legacy single-destination behaviour).
 
     Library-name matching has three rules, in priority order:
@@ -465,6 +809,15 @@ def _library_destination(base_destination: str, library: str, library_destinatio
        per-account GUID. (Configs that already use the literal current
        Apple zone name still work via rule 1.)
     3. **Fallthrough.** Returns ``base_destination`` unchanged.
+
+    Args:
+        base_destination: Root Photos destination
+        library: iCloud photo library name
+        library_destinations: Optional library-to-subdirectory mapping
+        create: Create a configured destination directory when true
+
+    Returns:
+        Resolved destination for the library
     """
     if not library_destinations:
         return base_destination
@@ -479,7 +832,8 @@ def _library_destination(base_destination: str, library: str, library_destinatio
     if subdir is None:
         return base_destination
     dest = os.path.join(base_destination, subdir)
-    os.makedirs(dest, exist_ok=True)
+    if create:
+        os.makedirs(dest, exist_ok=True)
     return dest
 
 

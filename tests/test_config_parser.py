@@ -526,6 +526,76 @@ class TestConfigParser(unittest.TestCase):
             config["photos"]["filters"]["libraries"],
         )
 
+    def test_get_photos_filters_libraries_disable_and_invalid(self):
+        """False disables regular libraries; invalid values retain default all."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["filters"]["libraries"] = False
+        self.assertFalse(config_parser.get_photos_filters(config=config)["libraries"])
+        config["photos"]["filters"]["libraries"] = "PrimarySync"
+        self.assertIsNone(config_parser.get_photos_filters(config=config)["libraries"])
+
+    def test_get_photos_shared_albums_filter_defaults_to_all(self):
+        """Missing or empty Shared Albums selection means sync all."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        self.assertIsNone(config_parser.get_photos_filters(config=config)["shared_albums"])
+        config["photos"]["filters"]["shared_albums"] = []
+        self.assertIsNone(config_parser.get_photos_filters(config=config)["shared_albums"])
+        config["photos"]["filters"]["shared_albums"] = None
+        self.assertIsNone(config_parser.get_photos_filters(config=config)["shared_albums"])
+
+    def test_get_photos_shared_albums_filter_disable_and_select(self):
+        """False disables while a list preserves exact display names."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["filters"]["shared_albums"] = False
+        self.assertFalse(config_parser.get_photos_filters(config=config)["shared_albums"])
+        config["photos"]["filters"]["shared_albums"] = ["Family", 42]
+        self.assertEqual(
+            config_parser.get_photos_filters(config=config)["shared_albums"],
+            ["Family", "42"],
+        )
+
+    def test_get_photos_shared_albums_filter_invalid_defaults_to_all(self):
+        """Invalid Shared Albums filter values warn and retain default inclusion."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["filters"]["shared_albums"] = "Family"
+        self.assertIsNone(config_parser.get_photos_filters(config=config)["shared_albums"])
+
+    def test_get_photos_shared_albums_destination_validation(self):
+        """Shared Albums use the hyphenated safe namespace by default."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        self.assertEqual(
+            config_parser.get_photos_shared_albums_destination(config=config),
+            "shared-albums",
+        )
+        config["photos"]["shared_albums_destination"] = "nas/shared-albums"
+        self.assertEqual(
+            config_parser.get_photos_shared_albums_destination(config=config),
+            "nas/shared-albums",
+        )
+        for invalid in ("", "/absolute", "a//b", "../escape", "a/./b"):
+            with self.subTest(invalid=invalid):
+                config["photos"]["shared_albums_destination"] = invalid
+                self.assertEqual(
+                    config_parser.get_photos_shared_albums_destination(config=config),
+                    "shared-albums",
+                )
+
+    def test_shared_albums_destination_conflict_detected(self):
+        """Library and Shared Album roots cannot silently overlap."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["shared_albums_destination"] = "SHARED-ALBUMS"
+        config["photos"]["library_destinations"] = {
+            "PrimarySync": "personal",
+            "SharedLibrary": "shared-albums",
+        }
+        self.assertTrue(
+            config_parser.photos_shared_albums_destination_conflicts(config=config),
+        )
+        config["photos"]["library_destinations"]["SharedLibrary"] = "shared"
+        self.assertFalse(
+            config_parser.photos_shared_albums_destination_conflicts(config=config),
+        )
+
     def test_get_telegram_bot_token(self):
         """Test for telegram bot token."""
         config = read_config(config_path=tests.CONFIG_PATH)

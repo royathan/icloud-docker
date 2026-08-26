@@ -9,7 +9,8 @@ import unittest
 from datetime import timezone
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import ANY, patch
 
 import icloudpy
 
@@ -2570,3 +2571,287 @@ class TestSyncPhotos(unittest.TestCase):
             )
         # Should return (0, 0) when sync_album_photos returns None
         self.assertEqual(result, (0, 0))
+
+    def test_shared_albums_default_to_album_shaped_download(self):
+        """Absent filter syncs every Shared Album through the normal downloader."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["destination"] = self.destination_path
+        shared_album = self.service.photos.libraries["PrimarySync"].albums["album-1"]
+        photos = SimpleNamespace(
+            libraries=self.service.photos.libraries,
+            shared_albums={"Family/Trips": shared_album},
+        )
+
+        successful, failed = sync_photos.sync_photos(config=config, photos=photos)
+
+        shared_destination = os.path.join(
+            self.destination_path,
+            "shared-albums",
+            "Family_Trips",
+        )
+        self.assertGreater(successful, 0)
+        self.assertEqual(failed, 0)
+        self.assertTrue(os.path.isdir(shared_destination))
+        self.assertTrue(os.listdir(shared_destination))
+
+    def test_shared_album_filter_selects_exact_name_and_isolates_errors(self):
+        """Only selected names run and one broken Shared Album does not stop the next."""
+        photos = SimpleNamespace(
+            shared_albums={"Bad": object(), "Good": object(), "Ignored": object()},
+        )
+        filters = {
+            "shared_albums": ["Bad", "Good", "Missing"],
+            "file_sizes": ["original"],
+            "extensions": None,
+        }
+        with (
+            patch(
+                "src.sync_photos.sync_album_photos",
+                side_effect=[RuntimeError("album failed"), (2, 0)],
+            ) as mock_sync,
+            self.assertLogs(sync_photos.LOGGER, level="WARNING") as captured,
+        ):
+            result = sync_photos._sync_shared_albums(  # noqa: SLF001
+                photos=photos,
+                selection=filters["shared_albums"],
+                destination_path=self.destination_path,
+                filters=filters,
+                files=set(),
+                folder_format=None,
+                hardlink_registry=None,
+                config=self.config,
+            )
+
+        self.assertEqual(result, (2, 1, True))
+        self.assertEqual(mock_sync.call_count, 2)
+        self.assertIn("Missing", "\n".join(captured.output))
+        self.assertIn("album failed", "\n".join(captured.output))
+
+    def test_regular_libraries_can_be_disabled_for_shared_album_smoke_test(self):
+        """A false libraries filter permits one narrowly scoped Shared Album run."""
+        family = SimpleNamespace(id="family-id")
+        photos = SimpleNamespace(shared_albums={"Family": family})
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["destination"] = self.destination_path
+        config["photos"]["filters"]["libraries"] = False
+        config["photos"]["filters"]["shared_albums"] = ["Family"]
+
+        with patch("src.sync_photos.sync_album_photos", return_value=(1, 0)) as mock_sync:
+            result = sync_photos.sync_photos(config=config, photos=photos)
+
+        self.assertEqual(result, (1, 0))
+        mock_sync.assert_called_once()
+        self.assertEqual(mock_sync.call_args.kwargs["album"], family)
+        self.assertEqual(
+            mock_sync.call_args.kwargs["destination_path"],
+            os.path.join(self.destination_path, "shared-albums", "Family"),
+        )
+
+    def test_shared_album_disable_does_not_touch_api(self):
+        """Explicit false is a true opt-out and avoids private API access."""
+
+        class Photos:
+            @property
+            def shared_albums(self):
+                message = "Shared Albums API should not be read"
+                raise AssertionError(message)
+
+        result = sync_photos._sync_shared_albums(  # noqa: SLF001
+            photos=Photos(),
+            selection=False,
+            destination_path=self.destination_path,
+            filters={"file_sizes": ["original"], "extensions": None},
+            files=set(),
+            folder_format=None,
+            hardlink_registry=None,
+            config=self.config,
+        )
+        self.assertEqual(result, (0, 0, False))
+
+    def test_shared_album_missing_empty_and_unexpected_api_are_non_fatal(self):
+        """Old clients, endpoint failures, empty accounts, and bad shapes continue."""
+
+        class MissingPhotos:
+            pass
+
+        class FailingPhotos:
+            @property
+            def shared_albums(self):
+                message = "private endpoint down"
+                raise RuntimeError(message)
+
+        filters = {"file_sizes": ["original"], "extensions": None}
+        for photos, expected in (
+            (MissingPhotos(), (0, 0, False)),
+            (FailingPhotos(), (0, 0, False)),
+            (SimpleNamespace(shared_albums=[]), (0, 0, False)),
+            (SimpleNamespace(shared_albums={}), (0, 0, True)),
+        ):
+            with self.subTest(photos=type(photos).__name__):
+                result = sync_photos._sync_shared_albums(  # noqa: SLF001
+                    photos=photos,
+                    selection=None,
+                    destination_path=self.destination_path,
+                    filters=filters,
+                    files=set(),
+                    folder_format=None,
+                    hardlink_registry=None,
+                    config=self.config,
+                )
+                self.assertEqual(result, expected)
+
+    def test_shared_album_none_result_and_selection_false_helpers(self):
+        """Defensive None results and direct disabled selection remain zero work."""
+        albums = {"Family": object()}
+        self.assertEqual(sync_photos._select_shared_albums(albums, False), {})  # noqa: SLF001
+        with patch("src.sync_photos.sync_album_photos", return_value=None):
+            result = sync_photos._sync_shared_albums(  # noqa: SLF001
+                photos=SimpleNamespace(shared_albums=albums),
+                selection=None,
+                destination_path=self.destination_path,
+                filters={"file_sizes": ["original"], "extensions": None},
+                files=set(),
+                folder_format=None,
+                hardlink_registry=None,
+                config=self.config,
+            )
+        self.assertEqual(result, (0, 0, True))
+
+    def test_shared_album_path_sanitization_and_collisions_are_stable(self):
+        """Unsafe/case-colliding names cannot escape or alias one another."""
+        albums = {
+            "Family/Trips": SimpleNamespace(id="album-1"),
+            "family\\trips": SimpleNamespace(id="album-2"),
+            "...": SimpleNamespace(id="album-3"),
+            "\x00": SimpleNamespace(id="album-4"),
+        }
+        first = sync_photos._shared_album_directory_names(albums)  # noqa: SLF001
+        second = sync_photos._shared_album_directory_names(  # noqa: SLF001
+            dict(reversed(list(albums.items()))),
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first["Family/Trips"].casefold(), first["family\\trips"].casefold())
+        self.assertTrue(first["Family/Trips"].startswith("Family_Trips__"))
+        expected_suffix = __import__("hashlib").sha256(b"album-1").hexdigest()[:10]
+        self.assertTrue(first["Family/Trips"].endswith(expected_suffix))
+        self.assertEqual(first["..."], "unnamed")
+        self.assertEqual(first["\x00"], "_")
+
+    def test_shared_album_collision_without_identifier_warns_and_stays_stable(self):
+        """Defensive legacy mocks fall back to name-based collision suffixes."""
+        albums = {"A/B": object(), "A\\B": object()}
+        with self.assertLogs(sync_photos.LOGGER, level="WARNING") as captured:
+            resolved = sync_photos._shared_album_directory_names(albums)  # noqa: SLF001
+        self.assertNotEqual(resolved["A/B"], resolved["A\\B"])
+        self.assertIn("no stable identifier", "\n".join(captured.output))
+
+    def test_shared_album_destination_conflict_skips_private_api(self):
+        """Conflicting library roots prevent an intentional source merge."""
+
+        class Photos:
+            libraries = self.service.photos.libraries
+
+            @property
+            def shared_albums(self):
+                message = "conflicting destination must skip API"
+                raise AssertionError(message)
+
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["destination"] = self.destination_path
+        config["photos"]["library_destinations"] = {
+            "PrimarySync": "shared-albums",
+        }
+        result = sync_photos.sync_photos(config=config, photos=Photos())
+        self.assertIsInstance(result, tuple)
+
+    def test_legacy_library_destinations_remain_shared_base(self):
+        """No destination mapping preserves the historical common root."""
+        self.assertEqual(
+            sync_photos._library_destination(self.destination_path, "PrimarySync", {}),  # noqa: SLF001
+            self.destination_path,
+        )
+        self.assertEqual(
+            sync_photos._library_destination(  # noqa: SLF001
+                self.destination_path,
+                "SharedSync-GUID",
+                {},
+            ),
+            self.destination_path,
+        )
+
+    def test_reserved_regular_album_name_skips_shared_albums(self):
+        """Legacy all-albums output cannot occupy the Shared Albums root."""
+        regular_album = SimpleNamespace(title="shared-albums")
+        primary = SimpleNamespace(
+            albums={"shared-albums": regular_album},
+            all=regular_album,
+        )
+        photos = SimpleNamespace(
+            libraries={"PrimarySync": primary},
+            shared_albums={"Family": SimpleNamespace(id="shared-id")},
+        )
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["destination"] = self.destination_path
+        config["photos"]["all_albums"] = True
+        config["photos"]["filters"]["albums"] = None
+
+        with (
+            patch("src.sync_photos.sync_album_photos", return_value=(0, 0)) as mock_sync,
+            self.assertLogs(sync_photos.LOGGER, level="ERROR") as captured,
+        ):
+            result = sync_photos.sync_photos(config=config, photos=photos)
+
+        self.assertEqual(result, (0, 0))
+        mock_sync.assert_called_once_with(
+            album=regular_album,
+            destination_path=os.path.join(self.destination_path, "shared-albums"),
+            file_sizes=["original", "medium", "thumb"],
+            extensions=None,
+            files=ANY,
+            folder_format=None,
+            hardlink_registry=None,
+            config=config,
+        )
+        self.assertIn("reserved iCloud Shared Albums root", "\n".join(captured.output))
+
+    def test_remove_obsolete_preserves_shared_files_when_api_unavailable(self):
+        """A missing private service cannot erase prior Shared Album downloads."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["destination"] = self.destination_path
+        config["photos"]["remove_obsolete"] = True
+        shared_root = os.path.join(self.destination_path, "shared-albums", "Family")
+        os.makedirs(shared_root, exist_ok=True)
+        prior_file = os.path.join(shared_root, "existing.jpg")
+        Path(prior_file).write_bytes(b"keep")
+        photos = SimpleNamespace(libraries=self.service.photos.libraries)
+
+        sync_photos.sync_photos(config=config, photos=photos)
+
+        self.assertTrue(os.path.isfile(prior_file))
+
+    def test_remove_obsolete_cleans_enumerated_shared_namespace_with_mappings(self):
+        """Mapped libraries and an enumerated Shared Albums root clean separately."""
+        config = read_config(config_path=tests.CONFIG_PATH)
+        config["photos"]["destination"] = self.destination_path
+        config["photos"]["remove_obsolete"] = True
+        config["photos"]["library_destinations"] = {
+            "PrimarySync": "personal",
+        }
+        photos = SimpleNamespace(
+            libraries=self.service.photos.libraries,
+            shared_albums={},
+        )
+        with (
+            patch("src.sync_photos._sync_albums_by_configuration", return_value=(0, 0)),
+            patch("src.sync_photos.remove_obsolete_files") as remove_files,
+        ):
+            sync_photos.sync_photos(config=config, photos=photos)
+
+        self.assertEqual(
+            [call.args[0] for call in remove_files.call_args_list],
+            [
+                os.path.join(self.destination_path, "personal"),
+                os.path.join(self.destination_path, "shared-albums"),
+            ],
+        )

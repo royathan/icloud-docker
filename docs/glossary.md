@@ -9,6 +9,8 @@ Domain terminology, acronyms, and project-specific vocabulary.
 | **iCloudPy** | Python library for interacting with iCloud services. Used as the API client. |
 | **Drive** | iCloud Drive — Apple's file storage service. Synced via `sync_drive.py`. |
 | **Photos** | iCloud Photos — Apple's photo storage service. Synced via `sync_photos.py`. |
+| **Shared Photo Library** | Apple's collaborative Photo Library feature. Exposed as a `SharedSync-*` entry in `photos.libraries`; it follows regular library filters and destinations. |
+| **Shared Album** | Apple's separate sharedstreams album feature. Exposed through `photos.shared_albums` and synced beneath the dedicated `shared-albums/` namespace. It is not a Shared Photo Library. |
 | **Oneshot mode** | Running a single sync cycle then exiting. Enabled by setting `sync_interval` to `-1`. |
 | **Mount marker** | A sentinel file (e.g., `.mounted`) that must exist before sync proceeds. Prevents writes to unmounted directories. |
 | **Trust cookie** | Apple's `X-APPLE-WEBAUTH-HSA-TRUST` cookie. ~90-day window before re-auth is required. |
@@ -28,5 +30,6 @@ Domain terminology, acronyms, and project-specific vocabulary.
 | **folder_format** | strftime pattern for date-based photo organization (e.g., `"%Y/%m"`). |
 | **enumeration_chunk_size** | Photos buffered per streaming chunk. Bounds peak memory on large libraries. |
 | **all_albums** | Config flag to preserve album structure. When true, photos organized by album. |
+| **shared_albums_destination** | Relative namespace reserved for Apple Shared Albums; defaults to `shared-albums`. |
 | **remove_obsolete** | Config flag to delete local files not present on server. |
 | **adaptive scheduling** | Algorithm that alternates Drive/Photos sync based on countdown timers. |

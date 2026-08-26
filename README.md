@@ -11,7 +11,7 @@
 
 🤟 **Please star this repository if you end up using this project. If it has improved your life in any way, consider donating to my mission using 'Sponsor' or 'Buy Me a Coffee' button. It will help me to continue supporting this product.** :pray:
 
-iCloud-docker (previously known as iCloud-drive-docker) is a simple iCloud client in Docker environment. It uses [iCloudPy](https://github.com/mandarons/icloudpy) python library to interact with iCloud server.
+iCloud-docker (previously known as iCloud-drive-docker) is a simple iCloud client in Docker environment. This branch uses the [Shared Albums-capable iCloudPy fork revision](https://github.com/royathan/icloudpy/tree/8ff5358aa5996ba3dce61a5fea7e8f25391dd2be) to interact with iCloud server.
 
 > **For developers and AI agents:** This project uses [OpenCode](https://opencode.ai) with `AGENTS.md` for agent instructions. See [docs/index.md](docs/index.md) for architecture documentation and [AGENTS.md](AGENTS.md) for build/test commands.
 
@@ -172,20 +172,24 @@ photos:
   use_hardlinks: false # Optional, default false. If true and all_albums is true, create hard links for duplicate photos instead of separate copies. Saves storage space.
   folder_format: "%Y/%m" # optional, if set put photos in subfolders according to format. Format cheatsheet - https://strftime.org
   # enumeration_chunk_size: 1000 # Optional, default 1000. Photos buffered per streaming chunk. Lower = lower peak memory on huge libraries, slightly more per-chunk overhead.
+  # Apple Shared Albums are a distinct source and always use this namespace.
+  shared_albums_destination: "shared-albums"
+  # Recommended NAS layout. Omit to preserve the legacy behavior where all
+  # regular and Shared Photo Libraries share photos.destination directly.
+  library_destinations:
+    PrimarySync: personal
+    SharedLibrary: shared # Alias for Apple's GUID-based SharedSync-* library
   # Optional: refuse to sync if a marker file is missing in the destination.
   # require_mount_marker: false
   filters:
-    # List of libraries to download. If omitted (default), photos from all libraries (own and shared) are downloaded. If included, photos only
-    # from the listed libraries are downloaded.
+    # Regular/Shared Photo Libraries: omit for all, false disables, or list names.
     # libraries:
     #   - PrimarySync # Name of the own library
 
-    # Per-library destination subdirectories (optional).
-    # When set, photos from each library are written to
-    # <photos.destination>/<subdirectory>/… instead of sharing one tree.
-    # library_destinations:
-    #   PrimarySync: personal
-    #   SharedLibrary: shared
+    # Apple Shared Albums are filtered independently. Omit for all, false to
+    # disable, or list exact display names.
+    shared_albums:
+      - "Family"
 
     # if all_albums is false - albums list is used as filter-in, if all_albums is true - albums list is used as filter-out
     # if albums list is empty and all_albums is false download all photos to "all" folder. if empty and all_albums is true download all folders
@@ -234,6 +238,185 @@ docker exec icloud icloud --username=<username> --session-directory=/config/sess
 ```
 
 The output reports per-library counts of: `would_skip` (already up-to-date), `size_mismatch`, `not_found`, and `error`. A high `would_skip` count means most files will not be re-downloaded during a real sync.
+
+## Apple Shared Albums
+
+Apple Shared Albums are not regular albums inside a Photo Library and are not
+Apple's Shared Photo Library feature. They are enumerated from
+`api.photos.shared_albums`, filtered independently, and always remain
+album-shaped beneath a dedicated namespace:
+
+```text
+photos/
+├── personal/             # PrimarySync, when library_destinations is configured
+├── shared/               # Shared Photo Library (SharedSync-* zone)
+└── shared-albums/        # Apple Shared Albums source type
+    └── Family/
+```
+
+If `library_destinations` is omitted, existing behavior is preserved: personal
+and Shared Photo Libraries both write directly below `photos.destination`.
+Apple Shared Albums still use `shared-albums/<album name>/`. A same-named
+regular album therefore does not normally collide with a Shared Album. The
+reserved edge case is a regular album itself named `shared-albums` when its
+planned output is exactly that namespace root; Shared Album sync is skipped
+with an actionable error rather than mixing source types. The same protection
+applies when `shared_albums_destination` equals a configured library root.
+
+Shared Album display names are NFC-normalized and unsafe path characters are
+replaced. Names that become equivalent on a case-insensitive filesystem receive
+a stable short suffix derived from Apple's Shared Album identifier; readable,
+non-colliding names are unchanged. The iCloudPy API is keyed by display name,
+so two Shared Albums with exactly identical display names cannot both be
+represented currently; that narrow limitation must be resolved in iCloudPy.
+
+`all_albums` and `filters.albums` apply only to Photo Libraries. Shared Albums
+remain album-shaped regardless of those settings. `filters.shared_albums` is
+independent: omit it for all Shared Albums, set it to `false` to disable them,
+or provide exact display names. Shared Albums use the same file-size,
+extension, date-folder, Live Photo, incremental, hardlink, cleanup, statistics,
+and error-isolation pipeline as other photo albums.
+
+Apple may recompress or resize Shared Album media. Consequently, `original`
+means the highest-quality resource Apple exposes through the Shared Albums
+service, not necessarily the full original uploaded by the owner.
+
+### NAS smoke test and rollout
+
+These commands build this branch locally, preserve authentication under
+`config/session_data`, and first sync only one named Shared Album. Replace the
+three values in angle brackets; never put the iCloud password in the config,
+command line, shell history, or logs.
+
+Prerequisites: Git, Docker, writable persistent NAS directories,
+and an Apple ID that can see at least one Shared Album.
+
+```bash
+git clone https://github.com/royathan/icloud-docker.git
+cd icloud-docker
+git checkout feat/shared-album-sync
+docker build --pull -t icloud-docker:shared-albums .
+
+export ICLOUD_NAS_ROOT="<absolute-NAS-path>/icloud-docker"
+mkdir -p "$ICLOUD_NAS_ROOT/config/session_data" "$ICLOUD_NAS_ROOT/data"
+```
+
+Create `$ICLOUD_NAS_ROOT/config/config.yaml` with a deliberately narrow,
+one-shot configuration:
+
+```yaml
+app:
+  root: /icloud
+  credentials:
+    username: "<apple-id-email>"
+    retry_login_interval: 600
+  logger:
+    level: info
+    filename: /config/icloud.log
+  max_threads: 2
+  region: global
+
+photos:
+  destination: photos
+  sync_interval: -1
+  remove_obsolete: false
+  all_albums: false
+  use_hardlinks: false
+  shared_albums_destination: shared-albums
+  filters:
+    libraries: false
+    shared_albums:
+      - "<Exact Shared Album Name>"
+    file_sizes:
+      - original
+```
+
+Start the container. The app will wait for authentication, leaving enough time
+to perform the interactive login:
+
+```bash
+docker run -d --name icloud-shared-test \
+  -e PUID="$(id -u)" \
+  -e PGID="$(id -g)" \
+  -e ENV_CONFIG_FILE_PATH=/config/config.yaml \
+  -v "$ICLOUD_NAS_ROOT/config:/config" \
+  -v "$ICLOUD_NAS_ROOT/data:/icloud" \
+  icloud-docker:shared-albums
+
+docker exec -it icloud-shared-test /bin/sh -c \
+  'su-exec abc icloud --username="<apple-id-email>" --session-directory=/config/session_data --list-shared-albums'
+```
+
+Enter the password only at the hidden interactive prompt and follow Apple's
+trusted-device/2FA prompts. The command lists names and stable IDs without
+enumerating album assets. For China-region accounts, add `--region=china` and
+set `app.region: china`.
+
+Before downloading, run the app's read-only checks:
+
+```bash
+docker exec icloud-shared-test /bin/sh -c \
+  'su-exec abc env HOME=/home/abc ENV_CONFIG_FILE_PATH=/config/config.yaml python /app/src/main.py --dry-run'
+
+docker exec icloud-shared-test /bin/sh -c \
+  'su-exec abc env HOME=/home/abc ENV_CONFIG_FILE_PATH=/config/config.yaml python /app/src/main.py --dry-run --check-files 5'
+```
+
+Look for `iCloud Shared Album '<name>' would sync to
+/icloud/photos/shared-albums/<name>` and confirm regular Photo Libraries are
+disabled. No files are written by either dry run. Then restart the one-shot
+container to perform the limited sync:
+
+```bash
+docker restart icloud-shared-test
+docker logs -f icloud-shared-test
+find "$ICLOUD_NAS_ROOT/data/photos/shared-albums/<Exact Shared Album Name>" -type f | head
+```
+
+Downloaded files appear under
+`$ICLOUD_NAS_ROOT/data/photos/shared-albums/<Exact Shared Album Name>/`; logs
+also persist at `$ICLOUD_NAS_ROOT/config/icloud.log`. Shared Album-specific log
+lines contain `iCloud Shared Album`. Reruns reuse the mounted session and skip
+same-sized existing files:
+
+```bash
+docker start -a icloud-shared-test
+```
+
+For the full NAS rollout, stop the test container, remove
+`filters.libraries: false` and either remove `filters.shared_albums` (all) or
+keep a desired list. The recommended layout is:
+
+```yaml
+photos:
+  destination: photos
+  shared_albums_destination: shared-albums
+  library_destinations:
+    PrimarySync: personal
+    SharedLibrary: shared
+```
+
+Set a positive `photos.sync_interval`, then recreate with the production
+restart policy:
+
+```bash
+docker rm -f icloud-shared-test
+docker run -d --name icloud \
+  --restart unless-stopped \
+  -e PUID="$(id -u)" -e PGID="$(id -g)" \
+  -e ENV_CONFIG_FILE_PATH=/config/config.yaml \
+  -v "$ICLOUD_NAS_ROOT/config:/config" \
+  -v "$ICLOUD_NAS_ROOT/data:/icloud" \
+  icloud-docker:shared-albums
+```
+
+Rollback does not delete downloads or sessions:
+
+```bash
+docker rm -f icloud
+docker image rm icloud-docker:shared-albums
+# Restore the prior image/config and recreate its container; keep both mounts.
+```
 
 ## Web UI
 

@@ -36,6 +36,9 @@ The sync cycle is the core operational loop that alternates between Drive and Ph
    - Check mount marker (if configured)
    - Walk local destination, count files before sync
    - Call `sync_photos.sync_photos()` to download new photos
+   - Sync regular/Shared Photo Libraries using existing destination behavior
+   - Independently sync Apple Shared Albums beneath the reserved namespace;
+     skip them if a planned destination would merge source types
    - Calculate stats (downloaded, skipped, hardlinked, bytes)
    - Reset photos countdown timer
 

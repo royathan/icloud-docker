@@ -58,6 +58,43 @@ class TestDryRunPerform(unittest.TestCase):
         self.assertIn("PrimarySync", joined)
         self.assertIn("SharedLibrary", joined)
 
+    def test_shared_albums_are_planned_in_dedicated_namespace(self):
+        """Dry-run reports selected Shared Albums without enumerating assets."""
+        api = self._make_api(photos_libraries={})
+        api.photos.shared_albums = {"Family/Trips": MagicMock(id="family-id")}
+        self.config["photos"]["filters"]["libraries"] = False
+        self.config["photos"]["filters"]["shared_albums"] = ["Family/Trips"]
+
+        with self.assertLogs(sync.LOGGER, level=logging.INFO) as cm:
+            sync._perform_dry_run(config=self.config, api=api)  # noqa: SLF001
+
+        joined = "\n".join(cm.output)
+        self.assertIn("Photo Library syncing is disabled by config", joined)
+        self.assertIn("iCloud Shared Album 'Family/Trips' would sync to", joined)
+        self.assertIn("shared-albums/Family_Trips", joined)
+
+    def test_shared_albums_disabled_empty_and_conflicting_are_reported(self):
+        """Dry-run makes every no-sync reason visible to the operator."""
+        api = self._make_api(photos_libraries={})
+        api.photos.shared_albums = {}
+        self.config["photos"]["filters"]["shared_albums"] = False
+        with self.assertLogs(sync.LOGGER, level=logging.INFO) as disabled_logs:
+            sync._perform_dry_run(config=self.config, api=api)  # noqa: SLF001
+        self.assertIn("disabled by config", "\n".join(disabled_logs.output))
+
+        del self.config["photos"]["filters"]["shared_albums"]
+        with self.assertLogs(sync.LOGGER, level=logging.INFO) as empty_logs:
+            sync._perform_dry_run(config=self.config, api=api)  # noqa: SLF001
+        self.assertIn("none selected or reported", "\n".join(empty_logs.output))
+
+        self.config["photos"]["shared_albums_destination"] = "personal"
+        self.config["photos"]["library_destinations"] = {
+            "PrimarySync": "personal",
+        }
+        with self.assertLogs(sync.LOGGER, level=logging.WARNING) as conflict_logs:
+            sync._perform_dry_run(config=self.config, api=api)  # noqa: SLF001
+        self.assertIn("would be skipped", "\n".join(conflict_logs.output))
+
     def test_drive_enumeration_failure_is_non_fatal(self):
         """Exception inside drive.dir() is caught and logged as a warning."""
         api = MagicMock()
@@ -162,6 +199,21 @@ class TestDryRunCheckFilesIntegration(unittest.TestCase):
             },
         }
 
+    def _shared_photos_result(self):
+        return {
+            "Family": {
+                "album_dest": "/photos/shared-albums/Family",
+                "checked": 2,
+                "stats": {
+                    "would_skip": 1,
+                    "size_mismatch": 0,
+                    "not_found": 1,
+                    "error": 0,
+                },
+                "samples": {},
+            },
+        }
+
     def test_check_files_invokes_both_walkers_and_logs_per_status(self):
         """Happy path: check_files=10 → call check_migration AND
         check_drive_migration, then log per-library + per-drive stats
@@ -176,6 +228,9 @@ class TestDryRunCheckFilesIntegration(unittest.TestCase):
             "src.migration_check.check_migration",
             return_value=self._photos_result(),
         ) as fake_photos, patch(
+            "src.migration_check.check_shared_albums_migration",
+            return_value=self._shared_photos_result(),
+        ) as fake_shared_photos, patch(
             "src.migration_check.check_drive_migration",
             return_value=self._drive_result(),
         ) as fake_drive, self.assertLogs(
@@ -189,6 +244,11 @@ class TestDryRunCheckFilesIntegration(unittest.TestCase):
                 check_files=10,
             )
         fake_photos.assert_called_once_with(api=api, config=self.config, sample=10)
+        fake_shared_photos.assert_called_once_with(
+            api=api,
+            config=self.config,
+            sample=10,
+        )
         fake_drive.assert_called_once_with(api=api, config=self.config, sample=10)
         joined = "\n".join(cm.output)
         self.assertIn("walking photos for file-existence check", joined)
@@ -200,6 +260,7 @@ class TestDryRunCheckFilesIntegration(unittest.TestCase):
         self.assertIn("sample not_found:", joined)
         # Drive section:
         self.assertIn("sampled=4", joined)
+        self.assertIn("iCloud Shared Album 'Family'", joined)
 
     def test_check_files_zero_means_walk_all(self):
         """check_files=0 is passed straight through and the log says

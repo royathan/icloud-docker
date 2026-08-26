@@ -4,7 +4,8 @@ The photos sync system (`src/sync_photos.py` + 6 helper modules) handles downloa
 
 ## Responsibilities
 
-- Enumerate photos from iCloud libraries (own + shared)
+- Enumerate photos from iCloud Photo Libraries (personal + Shared Photo Library)
+- Enumerate Apple Shared Albums as a separate source type
 - Support album-based organization with `all_albums` mode
 - Deduplicate across albums using hardlinks
 - Filter by file extensions and album preferences
@@ -33,7 +34,7 @@ Photos sync is purely a download system. It writes to the local filesystem at th
 
 | Function | Purpose |
 |----------|---------|
-| `sync_photos(config, photos)` | Main entry — enumerate libraries, delegate to album sync |
+| `sync_photos(config, photos)` | Main entry — enumerate libraries and Shared Albums, delegate to album sync |
 | `sync_album_photos(...)` | Sync a single album's photos |
 | `create_hardlink_registry(...)` | Create registry for cross-album dedup |
 
@@ -49,6 +50,32 @@ Photos sync is purely a download system. It writes to the local filesystem at th
 | `live_video_medium` | Live Photo video (medium) |
 | `live_video_thumb` | Live Photo video (thumb) |
 
+## Source Types and Destinations
+
+Photo Libraries retain their historical behavior. With no
+`library_destinations`, personal and Shared Photo Libraries write beneath the
+same `photos.destination`. Optional mappings can separate them; the
+`SharedLibrary` alias matches Apple's GUID-based `SharedSync-*` zone.
+
+Apple Shared Albums are not libraries and never use the `libraries` or
+`albums` filter. They are synced independently beneath
+`<photos.destination>/shared-albums/<album name>/` by default. The namespace is
+configurable with `shared_albums_destination`. A destination conflict with a
+configured library root, or a planned regular album output exactly matching
+the reserved Shared Albums root, skips Shared Album sync with an error rather
+than merging source types.
+
+Safe Shared Album names remain readable. Case-insensitive or sanitization-
+equivalent collisions receive a stable suffix derived from `album.id`. Exact
+duplicate display names cannot both appear because the current iCloudPy API is
+a name-keyed mapping.
+
+Shared Album assets reuse `sync_album_photos()`, so size/extension selection,
+date folders, Live Photos, incremental checks, hardlinks, cleanup tracking,
+parallel downloads, statistics, and per-photo error handling stay consistent.
+Apple may provide reduced-quality Shared Album resources; `original` is the
+best resource exposed by that service, not necessarily the uploader's original.
+
 ## Invariants
 
 - All file paths MUST be NFC-normalized with `unicodedata.normalize("NFC", path)`
@@ -56,6 +83,9 @@ Photos sync is purely a download system. It writes to the local filesystem at th
 - `HardlinkRegistry` tracks hardlinks across albums to prevent duplicates
 - `folder_format` uses strftime patterns (e.g., `"%Y/%m"`)
 - `enumeration_chunk_size` bounds peak memory (default 1000 photos/chunk)
+- Missing `filters.shared_albums` syncs all Shared Albums; `false` disables;
+  a list selects exact display names
+- `all_albums` affects Photo Libraries only; Shared Albums remain album-shaped
 - HTTP 410 Gone triggers download URL refresh via `_refresh_photo_download_url()`
 - URL refresh MUST use CloudKit `records/lookup`, not `records/query` — `CPLMaster`
   is not a query-indexable type and querying it always fails with

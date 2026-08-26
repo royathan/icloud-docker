@@ -24,6 +24,8 @@ The config system is a pure data layer — it does NOT perform sync operations, 
 | `get_app_max_threads(config)` | Return thread count (auto or 1-16) |
 | `prepare_drive_destination(config)` | Create and return drive dest path |
 | `prepare_photos_destination(config)` | Create and return photos dest path |
+| `get_photos_shared_albums_destination(config)` | Return the dedicated Shared Albums namespace |
+| `photos_shared_albums_destination_conflicts(config)` | Detect overlap with configured library roots |
 | `get_web_ui_enabled(config)` | Check if web UI is enabled |
 
 ## Config Access Pattern
@@ -48,6 +50,33 @@ config_path = ["app", "credentials", "username"]
 traverse_config_path(config=config, config_path=config_path)
 value = get_config_value(config=config, config_path=config_path)
 ```
+
+## Photos Source Selection
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `photos.library_destinations` | unset | Optional regular/Shared Photo Library subdirectories; unset preserves the legacy shared destination tree |
+| `photos.shared_albums_destination` | `shared-albums` | Dedicated relative namespace for Apple Shared Albums |
+| `photos.filters.libraries` | all | List exact Photo Library names, or `false` to disable regular libraries |
+| `photos.filters.albums` | existing behavior | Include/exclude regular albums according to `all_albums`; never applies to Shared Albums |
+| `photos.filters.shared_albums` | all | List exact Apple Shared Album names, or `false` to disable |
+
+Recommended NAS layout:
+
+```yaml
+photos:
+  destination: photos
+  shared_albums_destination: shared-albums
+  library_destinations:
+    PrimarySync: personal
+    SharedLibrary: shared
+```
+
+`shared_albums_destination` must not equal a configured library destination.
+At runtime, a regular album planned exactly at the Shared Albums namespace
+(for example `shared-albums` with legacy no-mapping + `all_albums: true`) also
+causes Shared Album sync to be skipped. The error directs the operator to
+configure distinct `shared_albums_destination` or `library_destinations` paths.
 
 ## Invariants
 
